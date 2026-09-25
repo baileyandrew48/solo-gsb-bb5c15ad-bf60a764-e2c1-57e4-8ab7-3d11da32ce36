@@ -283,6 +283,41 @@ def merge_device_windows(
     return {device: union(ivs) for device, ivs in by_device.items()}
 
 
+def attribute_windows(
+    piece: Interval, windows: Iterable[tuple[int, float, float]]
+) -> list[tuple[Interval, list[int]]]:
+    """Split a suppressed piece at its covering windows' half-open boundaries.
+
+    ``windows`` are ``(id, start, end)`` triples of the individual source
+    windows on one device (unmerged).  Every returned sub-segment carries
+    exactly the ids of the windows that actually cover it:
+
+    * overlapping windows share attribution on their common stretch;
+    * touching windows (``[a,b)`` then ``[b,c)``) hand over at the junction —
+      the piece is split there and each side names only its own window;
+    * a window meeting the piece only at a single point (zero-length
+      intersection) neither splits it nor appears in any attribution.
+
+    Stretches of ``piece`` covered by no window are not emitted.
+    """
+    bounds = {piece.start, piece.end}
+    spans: list[tuple[int, float, float]] = []
+    for wid, start, end in windows:
+        lo = max(float(start), piece.start)
+        hi = min(float(end), piece.end)
+        if hi > lo:  # zero-length contact contributes no boundary
+            spans.append((wid, lo, hi))
+            bounds.add(lo)
+            bounds.add(hi)
+    ordered = sorted(bounds)
+    segments: list[tuple[Interval, list[int]]] = []
+    for a, b in zip(ordered, ordered[1:]):
+        ids = sorted(wid for wid, lo, hi in spans if lo <= a and hi >= b)
+        if ids:
+            segments.append((Interval(a, b), ids))
+    return segments
+
+
 @dataclass
 class Condition:
     device: str
@@ -386,8 +421,11 @@ class SuppressedSegment:
     """Truth the rule *would* have had that was suppressed by maintenance.
 
     ``interval`` is always a piece of (raw truth − effective truth) ∩
-    (this condition's held intervals) ∩ (merged maintenance of its device):
-    the exact span where maintenance knocked the rule's truth out.
+    (this condition's held intervals) ∩ (merged maintenance of its device),
+    further split at the source windows' half-open boundaries so that
+    ``maintenance_ids`` names exactly the windows covering this piece —
+    overlapping windows share a piece, touching windows produce separate
+    pieces on either side of their junction.
     """
 
     device: str
@@ -512,7 +550,11 @@ def evaluate_rule(
 
     Returns the surviving fault intervals (length >= ``duration_required``)
     plus the suppressed segments: spans where the rule's truth was lost to
-    maintenance, attributed per condition channel and source window.
+    maintenance, attributed per condition channel.  Each segment is split at
+    the source windows' half-open boundaries and names only the windows that
+    actually cover it — overlapping windows share a segment, touching windows
+    switch attribution at their junction, and a zero-length contact neither
+    splits a segment nor is attributed.
     """
     logic = logic.upper()
     if logic not in LOGIC:
@@ -528,10 +570,10 @@ def evaluate_rule(
     merged_by_device = merge_device_windows(
         (w.device, w.start, w.end) for w in windows
     )
-    window_ids_by_device: dict[str, list[int]] = defaultdict(list)
+    windows_by_device: dict[str, list[MaintenanceWindow]] = defaultdict(list)
     for w in windows:
         if w.end > w.start:
-            window_ids_by_device[str(w.device)].append(w.id)
+            windows_by_device[str(w.device)].append(w)
 
     raw_held_per: list[list[Interval]] = []
     held_per: list[list[Interval]] = []
@@ -573,17 +615,23 @@ def evaluate_rule(
                 maint = merged_by_device.get(str(cond.device))
                 if not maint:
                     continue
+                device_windows = windows_by_device.get(str(cond.device), [])
                 for piece in intersect([raw_held, maint, lost]):
-                    suppressed.append(
-                        SuppressedSegment(
-                            device=str(cond.device),
-                            metric=str(cond.metric),
-                            interval=piece,
-                            maintenance_ids=sorted(
-                                window_ids_by_device.get(str(cond.device), [])
-                            ),
+                    # Split the piece at the source windows' half-open
+                    # boundaries: each emitted segment names only the windows
+                    # that actually cover it (shared on overlaps, switching
+                    # at touching junctions).
+                    for segment, ids in attribute_windows(
+                        piece, ((w.id, w.start, w.end) for w in device_windows)
+                    ):
+                        suppressed.append(
+                            SuppressedSegment(
+                                device=str(cond.device),
+                                metric=str(cond.metric),
+                                interval=segment,
+                                maintenance_ids=ids,
+                            )
                         )
-                    )
 
     faults: list[FaultInterval] = []
     for iv in truth:

@@ -3,7 +3,8 @@
 Maintenance windows are named half-open intervals on a device.  Evaluation
 merges overlapping/touching windows per device, subtracts them from that
 device's truth segments (resetting the sustained duration), and reports the
-suppressed pieces separately.
+suppressed pieces separately — each piece split at the source windows'
+boundaries so it names only the windows that actually cover it.
 """
 
 from app.engine import (
@@ -11,6 +12,7 @@ from app.engine import (
     Event,
     Interval,
     MaintenanceWindow,
+    attribute_windows,
     evaluate_rule,
     merge_device_windows,
     subtract,
@@ -138,11 +140,15 @@ def test_touching_maintenance_windows_merge_before_subtraction():
         maintenance=[mw(1, "d", 8, 10, "A"), mw(2, "d", 10, 12, "B")],
     )
     assert ivs(result.faults) == [(12 * 60, 17 * 60)]
-    assert [(s.interval.start, s.interval.end) for s in result.suppressed] == [
-        (8 * 60, 12 * 60)
+    # the merged cut is split at the junction: each piece names only the
+    # window that actually covers it
+    assert [
+        (s.interval.start, s.interval.end, s.maintenance_ids)
+        for s in result.suppressed
+    ] == [
+        (8 * 60, 10 * 60, [1]),
+        (10 * 60, 12 * 60, [2]),
     ]
-    # both source windows are linked to the merged suppressed piece
-    assert result.suppressed[0].maintenance_ids == [1, 2]
 
 
 def test_evidence_never_crosses_maintenance_boundary():
@@ -224,3 +230,133 @@ def test_maintenance_window_with_zero_length_is_ignored():
     )
     assert ivs(result.faults) == [(6 * 60, 17 * 60)]
     assert result.suppressed == []
+
+
+# --------------------------------------------------------------------------- #
+# per-segment window attribution
+# --------------------------------------------------------------------------- #
+
+
+def test_separated_windows_attribute_only_their_own_segments():
+    # two distant windows on the same device each cut the truth; each
+    # suppressed piece must point at its own window only, never at every
+    # window of the device
+    events = minute_series(100, lambda m: 90 if 6 <= m <= 28 else 10)
+    cond = Condition("d", "m", ">=", 80)
+    result = evaluate_rule(
+        1, "AND", 300, [cond], {("d", "m"): events},
+        horizon=30 * 60,
+        maintenance=[mw(1, "d", 8, 10, "A"), mw(2, "d", 20, 22, "B")],
+    )
+    # truth [6,29) cut at [8,10) and [20,22): [6,8) is too short, the two
+    # survivors re-accumulate the duration from their own starts
+    assert ivs(result.faults) == [(10 * 60, 20 * 60), (22 * 60, 29 * 60)]
+    assert result.faults[0].confirmed_at == 10 * 60 + 300
+    assert result.faults[1].confirmed_at == 22 * 60 + 300
+    assert [
+        (s.interval.start, s.interval.end, s.maintenance_ids)
+        for s in result.suppressed
+    ] == [
+        (8 * 60, 10 * 60, [1]),
+        (20 * 60, 22 * 60, [2]),
+    ]
+
+
+def test_overlapping_windows_share_attribution_on_the_overlap():
+    # windows [8,11) and [10,13) merge into one [8,13) cut; the suppressed
+    # piece splits at both window boundaries and the overlap names both
+    events = minute_series(100, lambda m: 90 if 6 <= m <= 20 else 10)
+    cond = Condition("d", "m", ">=", 80)
+    result = evaluate_rule(
+        1, "AND", 300, [cond], {("d", "m"): events},
+        horizon=30 * 60,
+        maintenance=[mw(1, "d", 8, 11, "A"), mw(2, "d", 10, 13, "B")],
+    )
+    assert ivs(result.faults) == [(13 * 60, 21 * 60)]
+    assert [
+        (s.interval.start, s.interval.end, s.maintenance_ids)
+        for s in result.suppressed
+    ] == [
+        (8 * 60, 10 * 60, [1]),
+        (10 * 60, 11 * 60, [1, 2]),
+        (11 * 60, 13 * 60, [2]),
+    ]
+
+
+def test_window_touching_piece_at_a_point_is_not_attributed():
+    # window B starts exactly where the suppressed piece ends: a zero-length
+    # contact neither splits the piece nor appears in its attribution
+    events = minute_series(100, lambda m: 90 if 6 <= m <= 11 else 10)  # held [6,12)
+    cond = Condition("d", "m", ">=", 80)
+    result = evaluate_rule(
+        1, "AND", 300, [cond], {("d", "m"): events},
+        horizon=30 * 60,
+        maintenance=[mw(1, "d", 10, 12, "A"), mw(2, "d", 12, 15, "B")],
+    )
+    # [6,10) survives the merged [10,15) cut but is shorter than the duration
+    assert result.faults == []
+    assert [
+        (s.interval.start, s.interval.end, s.maintenance_ids)
+        for s in result.suppressed
+    ] == [(10 * 60, 12 * 60, [1])]
+
+
+def test_contained_window_adds_shared_attribution_inside_its_span():
+    # a window fully inside another one shares attribution only on its span
+    events = minute_series(100, lambda m: 90 if 6 <= m <= 20 else 10)
+    cond = Condition("d", "m", ">=", 80)
+    result = evaluate_rule(
+        1, "AND", 300, [cond], {("d", "m"): events},
+        horizon=30 * 60,
+        maintenance=[mw(1, "d", 8, 14, "A"), mw(2, "d", 10, 12, "B")],
+    )
+    assert ivs(result.faults) == [(14 * 60, 21 * 60)]
+    assert [
+        (s.interval.start, s.interval.end, s.maintenance_ids)
+        for s in result.suppressed
+    ] == [
+        (8 * 60, 10 * 60, [1]),
+        (10 * 60, 12 * 60, [1, 2]),
+        (12 * 60, 14 * 60, [1]),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# attribute_windows primitive
+# --------------------------------------------------------------------------- #
+
+
+def test_attribute_windows_touching_windows_switch_at_junction():
+    assert attribute_windows(Interval(0, 20), [(1, 0.0, 10.0), (2, 10.0, 20.0)]) == [
+        (Interval(0, 10), [1]),
+        (Interval(10, 20), [2]),
+    ]
+
+
+def test_attribute_windows_overlapping_windows_share_common_stretch():
+    assert attribute_windows(Interval(0, 20), [(1, 0.0, 12.0), (2, 8.0, 20.0)]) == [
+        (Interval(0, 8), [1]),
+        (Interval(8, 12), [1, 2]),
+        (Interval(12, 20), [2]),
+    ]
+
+
+def test_attribute_windows_zero_length_contact_contributes_nothing():
+    # windows ending exactly at the piece start or starting exactly at its
+    # end neither split the piece nor are attributed
+    assert attribute_windows(
+        Interval(10, 20), [(1, 0.0, 10.0), (2, 10.0, 20.0), (3, 20.0, 30.0)]
+    ) == [(Interval(10, 20), [2])]
+
+
+def test_attribute_windows_identical_windows_share_whole_piece():
+    assert attribute_windows(Interval(0, 10), [(2, 0.0, 10.0), (1, 0.0, 10.0)]) == [
+        (Interval(0, 10), [1, 2])
+    ]
+
+
+def test_attribute_windows_drops_uncovered_stretches():
+    # a piece reaching beyond every window emits only its covered pieces
+    assert attribute_windows(Interval(0, 20), [(1, 3.0, 8.0)]) == [
+        (Interval(3, 8), [1])
+    ]
