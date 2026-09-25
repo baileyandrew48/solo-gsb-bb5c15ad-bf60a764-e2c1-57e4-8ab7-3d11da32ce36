@@ -13,6 +13,7 @@ from app.engine import (
     MaintenanceWindow,
     evaluate_rule,
     merge_device_windows,
+    split_with_window_attribution,
     subtract,
 )
 
@@ -82,6 +83,31 @@ def test_merge_device_windows_merges_overlap_and_touch_per_device():
     assert merged["pump-2"] == [Interval(0, 60)]
 
 
+def test_split_with_window_attribution_boundaries():
+    win = lambda wid, s, e: MaintenanceWindow(id=wid, device="d", start=s, end=e)
+    # zero-length pieces / windows are dropped, zero-length intersections emit nothing
+    assert split_with_window_attribution([Interval(10, 10)], [win(1, 0, 20)]) == []
+    assert split_with_window_attribution([Interval(0, 10)], [win(1, 5, 5)]) == []
+    # a window only touching at an endpoint covers no half-open subpiece, so
+    # the piece is dropped rather than attributed with no covering window
+    assert split_with_window_attribution([Interval(0, 5)], [win(1, 5, 10)]) == []
+    # windows fully outside the piece do not bound or attribute it
+    assert split_with_window_attribution(
+        [Interval(0, 10)], [win(1, 20, 30), win(2, -5, 0)]
+    ) == []
+    # overlapping windows share the overlap; touching windows switch at junction
+    pieces = split_with_window_attribution(
+        [Interval(0, 10)],
+        [win(7, 0, 6), win(8, 6, 10), win(9, 2, 4)],
+    )
+    assert [(p.start, p.end, ids) for p, ids in pieces] == [
+        (0, 2, [7]),
+        (2, 4, [7, 9]),
+        (4, 6, [7]),
+        (6, 10, [8]),
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # evaluation semantics
 # --------------------------------------------------------------------------- #
@@ -138,11 +164,57 @@ def test_touching_maintenance_windows_merge_before_subtraction():
         maintenance=[mw(1, "d", 8, 10, "A"), mw(2, "d", 10, 12, "B")],
     )
     assert ivs(result.faults) == [(12 * 60, 17 * 60)]
-    assert [(s.interval.start, s.interval.end) for s in result.suppressed] == [
-        (8 * 60, 12 * 60)
+    # the merged cut is one continuous span for truth/duration purposes, but
+    # attribution follows the half-open junction: each piece names only the
+    # window actually covering it (window 1 ends at 10*60, window 2 starts
+    # there), so the suppressed span is split at 10*60.
+    assert [
+        (s.interval.start, s.interval.end, s.maintenance_ids)
+        for s in result.suppressed
+    ] == [
+        (8 * 60, 10 * 60, [1]),
+        (10 * 60, 12 * 60, [2]),
     ]
-    # both source windows are linked to the merged suppressed piece
-    assert result.suppressed[0].maintenance_ids == [1, 2]
+
+
+def test_separate_windows_attribute_only_the_covering_window():
+    # Two far-apart windows each cut a fault: neither suppressed piece may
+    # point at the other window (regression for device-wide id attribution).
+    events = minute_series(100, lambda m: 90 if 2 <= m <= 28 else 10)
+    cond = Condition("d", "m", ">=", 80)
+    result = evaluate_rule(
+        1, "AND", 120, [cond], {("d", "m"): events},
+        horizon=30 * 60,
+        maintenance=[mw(1, "d", 6, 8, "A"), mw(2, "d", 20, 22, "B")],
+    )
+    attributed = [
+        (s.interval.start, s.interval.end, tuple(s.maintenance_ids))
+        for s in result.suppressed
+    ]
+    assert attributed == [
+        (6 * 60, 8 * 60, (1,)),
+        (20 * 60, 22 * 60, (2,)),
+    ]
+
+
+def test_overlapping_windows_share_attribution_on_their_overlap():
+    # [9,11) and [10,12) overlap on [10,11); the suppressed span is split at
+    # both boundaries with joint attribution only inside the overlap.
+    events = minute_series(100, lambda m: 90 if 6 <= m <= 16 else 10)
+    cond = Condition("d", "m", ">=", 80)
+    result = evaluate_rule(
+        1, "AND", 300, [cond], {("d", "m"): events},
+        horizon=30 * 60,
+        maintenance=[mw(1, "d", 9, 11, "A"), mw(2, "d", 10, 12, "B")],
+    )
+    assert [
+        (s.interval.start, s.interval.end, s.maintenance_ids)
+        for s in result.suppressed
+    ] == [
+        (9 * 60, 10 * 60, [1]),
+        (10 * 60, 11 * 60, [1, 2]),
+        (11 * 60, 12 * 60, [2]),
+    ]
 
 
 def test_evidence_never_crosses_maintenance_boundary():
